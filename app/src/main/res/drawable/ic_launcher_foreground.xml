@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MIT logo: 7 white rectangles (official 321x166 grid scaled x0.18), centered
+     inside the adaptive-icon safe zone so no launcher mask clips it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M25.1,39.1L31.4,39.1L31.4,69L25.1,69Z M35.4,39.1L41.7,39.1L41.7,59.4L35.4,59.4Z M45.6,39.1L51.9,39.1L51.9,69L45.6,69Z M55.9,39.1L62.2,39.1L62.2,45L55.9,45Z M55.9,48.6L62.2,48.6L62.2,69L55.9,69Z M66.3,48.6L72.6,48.6L72.6,69L66.3,69Z M66.3,39.1L82.9,39.1L82.9,45L66.3,45Z" />
+</vector>
