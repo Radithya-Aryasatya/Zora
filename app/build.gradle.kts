@@ -66,7 +66,14 @@ dependencies {
     // Core Generative AI Models
     implementation("com.google.ai.client.generativeai:generativeai:0.9.0")
 
+    // CameraX — phone camera replaces XIAO ESP32S3 Sense as the "eyes"
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+
     // Peripheral Transmit Pipeline (Xiao Hardware Comm Link)
+    // Kept for the future USB-C button peripheral (Arduino/Nano etc.)
     implementation("com.github.mik3y:usb-serial-for-android:3.7.0")
 
     implementation("com.github.bumptech.glide:glide:4.15.1")

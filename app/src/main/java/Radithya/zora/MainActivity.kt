@@ -33,6 +33,13 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.MediaStore
 import android.view.KeyEvent
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts.RequestPermission
+import androidx.lifecycle.lifecycleScope
+import Radithya.zora.CameraEngine
 import kotlinx.coroutines.withTimeout
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.foundation.lazy.LazyColumn
@@ -129,6 +136,8 @@ class MainActivity : ComponentActivity() {
     var triggerScan: () -> Unit = {}
     private var tts: TextToSpeech? = null
     var usbPort: UsbSerialPort? = null
+    var cameraEngine: CameraEngine? = null
+    private lateinit var cameraPermissionLauncher: ActivityResultLauncher<String>
 
     fun vibrateOnScan(context: Context) {
         val vibrator = context.getSystemService(VIBRATOR_SERVICE) as Vibrator
@@ -149,6 +158,42 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+
+        // --- CAMERA PERMISSION + ENGINE INIT (replaces XIAO USB init) ---
+        cameraPermissionLauncher = registerForActivityResult(RequestPermission()) { granted ->
+            if (granted) {
+                lifecycleScope.launch {
+                    cameraEngine = CameraEngine(applicationContext)
+                    val started = cameraEngine!!.start(this@MainActivity)
+                    if (started) {
+                        screenLog("ZoraCamera", "Camera engine started (phone back camera)")
+                        tts?.speak("Camera ready", TextToSpeech.QUEUE_ADD, null, null)
+                    } else {
+                        screenLog("ZoraCamera", "Camera engine failed to start")
+                        tts?.speak("Camera failed to start", TextToSpeech.QUEUE_ADD, null, null)
+                    }
+                }
+            } else {
+                screenLog("ZoraCamera", "Camera permission denied")
+                tts?.speak("Camera permission is required to scan", TextToSpeech.QUEUE_ADD, null, null)
+            }
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        } else {
+            lifecycleScope.launch {
+                cameraEngine = CameraEngine(applicationContext)
+                val started = cameraEngine!!.start(this@MainActivity)
+                if (started) {
+                    screenLog("ZoraCamera", "Camera engine started (phone back camera)")
+                    tts?.speak("Camera ready", TextToSpeech.QUEUE_ADD, null, null)
+                } else {
+                    screenLog("ZoraCamera", "Camera engine failed to start")
+                    tts?.speak("Camera failed to start", TextToSpeech.QUEUE_ADD, null, null)
+                }
+            }
+        }
         setContent {
             ZoraTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -173,6 +218,7 @@ class MainActivity : ComponentActivity() {
         try {
             usbPort?.close()
         } catch (e: Exception) {}
+        cameraEngine?.stop()
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()
@@ -512,20 +558,18 @@ suspend fun fetchAndDescribe(context: Context): String {
         val overallStart = System.currentTimeMillis()
         try {
             withTimeout(25000L) {
-                // 1. XIAO TO PHONE
-                val usbStart = System.currentTimeMillis()
-                val rawDownloaded = captureFrameFromUsb(context)
-                screenLog("ZoraTime", "1. USB Transfer: ${System.currentTimeMillis() - usbStart}ms")
+                // 1. PHONE CAMERA (replaces XIAO USB capture)
+                val camStart = System.currentTimeMillis()
+                val cameraEngine = (context as? MainActivity)?.cameraEngine
+                val rawDownloaded = cameraEngine?.capturePhoto()
+                screenLog("ZoraTime", "1. Camera Capture: ${System.currentTimeMillis() - camStart}ms")
 
-                if (rawDownloaded == null) return@withTimeout "Gagal Kamera: Koneksi USB terputus."
+                if (rawDownloaded == null) return@withTimeout "Gagal Kamera: Kamera tidak siap atau izin kamera ditolak."
 
-                // 2. IMAGE PROCESSING
+                // 2. IMAGE PROCESSING (CameraEngine already returns rotation-corrected Bitmap;
+                // no hardcoded 270deg rotate + mirror flip needed anymore)
                 val procStart = System.currentTimeMillis()
-                val matrix = Matrix().apply {
-                    postRotate(270f) // Uprighted image
-                    postScale(-1f, 1f, rawDownloaded.width / 2f, rawDownloaded.height / 2f)
-                }
-                val finalBmp = Bitmap.createBitmap(rawDownloaded, 0, 0, rawDownloaded.width, rawDownloaded.height, matrix, true)
+                val finalBmp = rawDownloaded
 
                 if (finalBmp == null) return@withTimeout "Gagal: Memori penuh."
 
@@ -548,7 +592,7 @@ suspend fun fetchAndDescribe(context: Context): String {
 
                 val prompt = """
                 ACT AS: Expert blind guide.
-                CONTEXT: The user wears a sensor camera on glasses.
+                CONTEXT: The user holds a phone with a rear-facing camera.
                 TASK: Briefly and clearly describe the most important thing in front of the user.
                 FORMAT: Describe what the user sees. Maximum 60 words. In English
                 NOTES: Ignore the blurry camera quality.
@@ -819,7 +863,8 @@ fun exportErrorsToDocuments(context: Context) {
 }
 // end
 
-// System works by XIAO ESP32S3 Sense -> (USB C transport) Android Companion App -> Cloud LVLM Round trip back and forth -> Android Companion App -> Audio output speech to user
+// System works by Phone Back Camera (CameraX) -> Android Companion App -> Cloud LVLM Round trip back and forth -> Android Companion App -> Audio output speech to user
+// USB serial (XIAO) code kept dormant below for the future USB-C button peripheral (Arduino/Nano etc.)
 
 
 
