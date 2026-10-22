@@ -5,6 +5,7 @@ import android.content.ContentValues
 import android.util.Log
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.Bitmap
@@ -133,10 +134,20 @@ fun deleteErrorLog () {
 }
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        private const val UTTERANCE_ID = "zora_utterance"
+        // Max time we wait for the TTS to finish before opening the mic anyway.
+        private const val TTS_SAFETY_TIMEOUT_MS = 1500L
+    }
+
     var triggerScan: () -> Unit = {}
     private var tts: TextToSpeech? = null
     var usbPort: UsbSerialPort? = null
     var cameraEngine: CameraEngine? = null
+    private lateinit var micPermissionLauncher: ActivityResultLauncher<String>
+    private var pendingVoiceResult: ((String) -> Unit)? = null
+    private var pendingVoiceError: ((String) -> Unit)? = null
+    var speechInputEngine: SpeechInputEngine? = null
     private lateinit var cameraPermissionLauncher: ActivityResultLauncher<String>
 
     fun vibrateOnScan(context: Context) {
@@ -194,6 +205,28 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+
+        // --- MICROPHONE PERMISSION (voice request mode) ---
+        micPermissionLauncher = registerForActivityResult(RequestPermission()) { granted ->
+            if (granted) {
+                screenLog("ZoraMic", "Microphone permission granted")
+                pendingVoiceResult?.let { result ->
+                    pendingVoiceError?.let { error ->
+                        doVoiceListening(result, error)
+                    }
+                }
+                pendingVoiceResult = null
+                pendingVoiceError = null
+            } else {
+                pendingVoiceError?.invoke("Microphone permission is required for voice requests.")
+                pendingVoiceResult = null
+                pendingVoiceError = null
+            }
+        }
+
+        // --- SPEECH INPUT ENGINE (voice request mode) ---
+        speechInputEngine = SpeechInputEngine.create(this, lifecycleScope)
+
         setContent {
             ZoraTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -219,9 +252,66 @@ class MainActivity : ComponentActivity() {
             usbPort?.close()
         } catch (e: Exception) {}
         cameraEngine?.stop()
+        speechInputEngine?.let { SpeechInputEngine.release() }
+        speechInputEngine = null
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()
+    }
+
+    /**
+     * Cancels an in-flight voice request and releases the microphone.
+     */
+    fun stopVoiceListening() {
+        speechInputEngine?.stop()
+        pendingVoiceResult = null
+        pendingVoiceError = null
+    }
+
+    /**
+     * Speaks a short prompt and only runs [action] once the TTS has finished.
+     *
+     * This is what keeps the voice mode usable: if we opened the microphone
+     * while Zora was still saying "Listening", the recognizer would pick up
+     * Zora's own voice and transcribe it instead of the user's request.
+     *
+     * QUEUE_FLUSH is used so the prompt always starts immediately, cutting off
+     * whatever was being spoken before. A safety timeout guarantees [action]
+     * still runs if the TTS engine never reports back (e.g. not yet ready).
+     */
+    fun speakThen(prompt: String, action: () -> Unit) {
+        val engine = tts
+        if (engine == null) {
+            action()
+            return
+        }
+
+        // Guard so the action can only ever run once, whichever comes first.
+        val fired = java.util.concurrent.atomic.AtomicBoolean(false)
+        val trigger = {
+            if (fired.compareAndSet(false, true)) {
+                runOnUiThread { action() }
+            }
+        }
+
+        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                if (utteranceId == UTTERANCE_ID) trigger()
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                if (utteranceId == UTTERANCE_ID) trigger()
+            }
+        })
+
+        // Safety net: if the TTS never answers, still open the mic.
+        lifecycleScope.launch {
+            delay(TTS_SAFETY_TIMEOUT_MS)
+            trigger()
+        }
+
+        engine.speak(prompt, TextToSpeech.QUEUE_FLUSH, null, UTTERANCE_ID)
     }
 
     // Add this inside your MainActivity class
@@ -233,6 +323,32 @@ class MainActivity : ComponentActivity() {
             return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    // ========================================================================
+    // VOICE REQUEST MODE (new flexible task system)
+    // ========================================================================
+
+    private fun doVoiceListening(onResult: (String) -> Unit, onError: (String) -> Unit) {
+        speechInputEngine?.start(
+            onFinal = { text -> onResult(text) },
+            onErr = { msg -> onError(msg) }
+        )
+    }
+
+    /**
+     * Call from the UI when the user taps "SPEAK REQUEST".
+     * Handles RECORD_AUDIO permission, then starts listening.
+     * The recognised text is delivered via onResult — nothing is echoed here.
+     */
+    fun startVoiceListening(onResult: (String) -> Unit, onError: (String) -> Unit) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingVoiceResult = onResult
+            pendingVoiceError = onError
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            doVoiceListening(onResult, onError)
+        }
     }
 }
 
@@ -250,10 +366,12 @@ fun LensScreen(modifier: Modifier = Modifier, onSpeak: (String) -> Unit, onStopS
     var isLoading by remember { mutableStateOf(false) }
     var lastScanTime by remember { mutableLongStateOf(0L) }
     var currentTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var voiceRequest by remember { mutableStateOf("") }
+    var isListening by remember { mutableStateOf(false) }
 
     val cooldownMs = 7000L
 
-    val performScan = {
+    fun performScan(userRequest: String? = null) {
         val clickTime = System.currentTimeMillis()
         if (!isLoading && (clickTime - lastScanTime >= cooldownMs)) {
             lastScanTime = clickTime
@@ -261,7 +379,7 @@ fun LensScreen(modifier: Modifier = Modifier, onSpeak: (String) -> Unit, onStopS
             onSpeak("Scanning")
             isLoading = true
             activeJob = coroutineScope.launch {
-                val result = fetchAndDescribe(context)
+                val result = fetchAndDescribe(context, userRequest)
                 description = result
                 onSpeak(result)
                 isLoading = false
@@ -271,7 +389,7 @@ fun LensScreen(modifier: Modifier = Modifier, onSpeak: (String) -> Unit, onStopS
         }
     }
     LaunchedEffect(Unit) {
-        (context as? MainActivity)?.triggerScan = performScan
+        (context as? MainActivity)?.triggerScan = { performScan() }
     }
 
     LaunchedEffect(Unit) {
@@ -514,8 +632,47 @@ fun LensScreen(modifier: Modifier = Modifier, onSpeak: (String) -> Unit, onStopS
 
             Button(
                 onClick = {
+                    (context as? MainActivity)?.let { mainActivity ->
+                        isListening = true
+                        // Wait until Zora stops saying "Listening" before opening
+                        // the mic, otherwise the recognizer transcribes Zora itself.
+                        mainActivity.speakThen("Listening") {
+                            mainActivity.startVoiceListening(
+                                onResult = { text ->
+                                    voiceRequest = text
+                                    isListening = false
+                                    screenLog("ZoraVoice", "Recognised: $text")
+                                    onSpeak("Processing")
+                                    performScan(text)
+                                },
+                                onError = { msg ->
+                                    isListening = false
+                                    screenLog("ZoraVoice", "Voice error: $msg")
+                                    onSpeak(msg)
+                                }
+                            )
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().height(100.dp),
+                enabled = !isLoading && !isListening
+            ) {
+                Text(
+                    text = when {
+                        isListening -> "LISTENING... (speak now)"
+                        else -> "SPEAK REQUEST"
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            Button(
+                onClick = {
                     activeJob?.cancel()
                     onStopSpeak()
+                    (context as? MainActivity)?.stopVoiceListening()
+                    isListening = false
                     isLoading = false
                     description = "Scan cancelled."
                 },
@@ -553,7 +710,7 @@ fun LensScreen(modifier: Modifier = Modifier, onSpeak: (String) -> Unit, onStopS
 // END OF COMPOSABLE
 
 
-suspend fun fetchAndDescribe(context: Context): String {
+suspend fun fetchAndDescribe(context: Context, userRequest: String? = null): String {
     return withContext(Dispatchers.IO) {
         val overallStart = System.currentTimeMillis()
         try {
@@ -590,13 +747,13 @@ suspend fun fetchAndDescribe(context: Context): String {
                 // 3. GEMINI ROUNDTRIP (cloud LVLM)
                 Log.d("Zora", "Using Model: ${geminiMainModel.modelName}")
 
-                val prompt = """
-                ACT AS: Expert blind guide.
-                CONTEXT: The user holds a phone with a rear-facing camera.
-                TASK: Briefly and clearly describe the most important thing in front of the user.
-                FORMAT: Describe what the user sees. Maximum 60 words. In English
-                NOTES: Ignore the blurry camera quality.
-                """.trimIndent()
+                // --- PROMPT BUILDER ---
+                // Volume button / SCAN button (userRequest == null) keeps the
+                // original generic "describe environment" prompt byte-for-byte.
+                // Voice request mode injects the user's spoken task while keeping
+                // the blind-user context baked in so output is conditioned accurately.
+                val prompt = buildPrompt(userRequest)
+
 
                 val aiStart = System.currentTimeMillis()
 
@@ -642,6 +799,39 @@ suspend fun fetchAndDescribe(context: Context): String {
         }
     }
     }
+}
+
+// --- DYNAMIC PROMPT BUILDER (voice request mode) ---
+//
+// When userRequest is null (volume button / SCAN button), the original generic
+// "describe the environment" prompt is returned byte-for-byte so existing mode
+// is unchanged.
+//
+// When userRequest is present, the spoken request becomes the TASK while the
+// blind-user context is baked in so Gemini's output is conditioned accurately.
+private fun buildPrompt(userRequest: String?): String {
+    val request = userRequest?.trim()
+
+    if (request.isNullOrBlank()) {
+        return """
+            ACT AS: Expert blind guide.
+            CONTEXT: The user holds a phone with a rear-facing camera.
+            TASK: Briefly and clearly describe the most important thing in front of the user.
+            FORMAT: Describe what the user sees. Maximum 60 words. In English
+            NOTES: Ignore the blurry camera quality.
+        """.trimIndent()
+    }
+
+    return """
+        ACT AS: Expert blind guide.
+        CONTEXT: The user is a visually impaired individual holding a phone with the rear-facing camera.
+        TASK: $request
+        RULES: If the request cannot be fulfilled from this image, say so briefly.
+               If asked to read text, read it aloud in natural reading order.
+               Ignore the blurry camera quality.
+               Maximum 60 words, unless the user asked you to read text.
+               In English.
+    """.trimIndent()
 }
 
 // This helps the app talk to the XIAO via USB

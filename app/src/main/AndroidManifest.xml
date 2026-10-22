@@ -8,6 +8,19 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+        Required so the app can discover the system speech recognition service
+        on Android 11+ (package visibility). Without this, SpeechRecognizer
+        cannot resolve any RecognitionService and speech input fails.
+        See SpeechRecognizer#createSpeechRecognizer in the framework docs.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
 
 
     <application
